@@ -21,6 +21,8 @@ From this repo:
 node ./src/cli.js tasks /path/to/workspace
 node ./src/cli.js run /path/to/workspace
 node ./src/cli.js run /path/to/workspace --prompt-file prompts/task-runner.md
+node ./src/cli.js run /path/to/workspace --observe transcript
+node ./src/cli.js tail /path/to/workspace
 node ./src/cli.js status /path/to/workspace
 node ./src/cli.js attach /path/to/workspace
 ```
@@ -87,8 +89,38 @@ Relative prompt paths are resolved from the target workspace. Available variable
 
 See `templates/task-prompt.md` for a starter template.
 
+## Observation
+
+Live output is controlled with:
+
+```bash
+node ./src/cli.js run /path/to/workspace --observe compact
+```
+
+Modes:
+
+| Mode | Description |
+| --- | --- |
+| `compact` | Default. Assistant text, tool calls, and truncated tool results. |
+| `transcript` | Role-labeled conversation view with larger tool-result excerpts. |
+| `raw` | Raw Pi RPC JSONL, including responses. |
+| `quiet` | Suppress per-event output; only orchestrator task/block/done messages. |
+
+To observe a current run from another terminal:
+
+```bash
+node ./src/cli.js tail /path/to/workspace --observe transcript
+```
+
+You can also tail a specific raw log file:
+
+```bash
+node ./src/cli.js tail /path/to/workspace/.pi-orchestrator/logs/<run>.jsonl --observe compact
+```
+
 ## Options
 
 ```bash
-node ./src/cli.js run [workspace] [--plan agent-plans/plan.md] [--prompt-file prompt.md] [--pi pi] [--once] [--max-tasks N]
+node ./src/cli.js run [workspace] [--plan agent-plans/plan.md] [--prompt-file prompt.md] [--observe compact|transcript|raw|quiet] [--pi pi] [--once] [--max-tasks N]
+node ./src/cli.js tail [workspace|log.jsonl] [--observe compact|transcript|raw|quiet]
 ```

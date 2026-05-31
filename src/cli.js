@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 import { spawn } from "node:child_process";
-import { createWriteStream } from "node:fs";
-import { mkdir, readFile, writeFile, appendFile, access } from "node:fs/promises";
+import { createReadStream, createWriteStream } from "node:fs";
+import { mkdir, readFile, writeFile, appendFile, access, stat } from "node:fs/promises";
 import { constants as fsConstants } from "node:fs";
 import path from "node:path";
 import process from "node:process";
@@ -9,11 +9,13 @@ import { StringDecoder } from "node:string_decoder";
 
 const DEFAULT_PLAN = "agent-plans/plan.md";
 const STATE_DIR = ".pi-orchestrator";
+const OBSERVE_MODES = new Set(["compact", "transcript", "raw", "quiet"]);
 
 function usage(exitCode = 0) {
   console.log(`Usage:
   pi-orchestrator tasks [workspace] [--plan ${DEFAULT_PLAN}]
-  pi-orchestrator run [workspace] [--plan ${DEFAULT_PLAN}] [--prompt-file prompt.md] [--pi pi] [--once] [--max-tasks N]
+  pi-orchestrator run [workspace] [--plan ${DEFAULT_PLAN}] [--prompt-file prompt.md] [--observe compact|transcript|raw|quiet] [--pi pi] [--once] [--max-tasks N]
+  pi-orchestrator tail [workspace|log.jsonl] [--observe compact|transcript|raw|quiet]
   pi-orchestrator status [workspace]
   pi-orchestrator attach [workspace]
 
@@ -30,6 +32,7 @@ function parseArgs(argv) {
     plan: DEFAULT_PLAN,
     pi: "pi",
     promptFile: undefined,
+    observe: "compact",
     once: false,
     maxTasks: Number.POSITIVE_INFINITY,
   };
@@ -40,6 +43,7 @@ function parseArgs(argv) {
     if (arg === "--plan") opts.plan = requireValue(rest, ++i, "--plan");
     else if (arg === "--pi") opts.pi = requireValue(rest, ++i, "--pi");
     else if (arg === "--prompt-file") opts.promptFile = requireValue(rest, ++i, "--prompt-file");
+    else if (arg === "--observe") opts.observe = requireValue(rest, ++i, "--observe");
     else if (arg === "--once") opts.once = true;
     else if (arg === "--max-tasks") opts.maxTasks = Number(requireValue(rest, ++i, "--max-tasks"));
     else if (arg.startsWith("--")) throw new Error(`Unknown option: ${arg}`);
@@ -48,6 +52,9 @@ function parseArgs(argv) {
   }
 
   opts.workspace = path.resolve(opts.workspace ?? process.cwd());
+  if (!OBSERVE_MODES.has(opts.observe)) {
+    throw new Error(`--observe must be one of: ${[...OBSERVE_MODES].join(", ")}`);
+  }
   if (opts.maxTasks !== Number.POSITIVE_INFINITY && (!Number.isFinite(opts.maxTasks) || opts.maxTasks < 1)) {
     throw new Error("--max-tasks must be a positive number");
   }
@@ -127,6 +134,80 @@ async function commandStatus(opts) {
   console.log(JSON.stringify(current, null, 2));
 }
 
+async function commandTail(opts) {
+  const logPath = await resolveTailLogPath(opts);
+  await assertFileReadable(logPath, "Log");
+
+  const observer = new EventObserver({ mode: opts.observe });
+  let offset = await replayLog(logPath, observer);
+  if (opts.observe !== "raw" && opts.observe !== "quiet") {
+    console.log(`\n[tailing ${logPath}; Ctrl+C to stop]`);
+  }
+
+  process.on("SIGINT", () => process.exit(0));
+  while (true) {
+    await delay(1000);
+    let info;
+    try {
+      info = await stat(logPath);
+    } catch (error) {
+      if (error?.code === "ENOENT") continue;
+      throw error;
+    }
+    if (info.size < offset) offset = 0;
+    if (info.size > offset) offset = await replayLog(logPath, observer, offset);
+  }
+}
+
+async function resolveTailLogPath(opts) {
+  if (opts.workspace.endsWith(".jsonl")) return opts.workspace;
+  const current = await readCurrent(opts.workspace);
+  if (!current?.logPath) {
+    throw new Error(`No current logPath found in ${statePaths(opts.workspace).current}`);
+  }
+  return current.logPath;
+}
+
+async function replayLog(logPath, observer, start = 0) {
+  let size = start;
+  await new Promise((resolve, reject) => {
+    const stream = createReadStream(logPath, { start, encoding: "utf8" });
+    let buffer = "";
+    stream.on("data", (chunk) => {
+      buffer += chunk;
+      while (true) {
+        const newlineIndex = buffer.indexOf("\n");
+        if (newlineIndex === -1) break;
+        let line = buffer.slice(0, newlineIndex);
+        buffer = buffer.slice(newlineIndex + 1);
+        if (line.endsWith("\r")) line = line.slice(0, -1);
+        processLogLine(line, observer);
+      }
+    });
+    stream.on("error", reject);
+    stream.on("end", resolve);
+  });
+  try {
+    size = (await stat(logPath)).size;
+  } catch {
+    // Keep previous offset if the file disappeared after replay.
+  }
+  return size;
+}
+
+function processLogLine(line, observer) {
+  if (!line.trim()) return;
+  observer.observeLine(line);
+  let message;
+  try {
+    message = JSON.parse(line);
+  } catch {
+    if (observer.mode !== "raw" && observer.mode !== "quiet") console.error(`Failed to parse log line: ${line}`);
+    return;
+  }
+  if (message.type !== "response") observer.observeEvent(message);
+}
+
 async function commandAttach(opts) {
   const current = await readCurrent(opts.workspace);
   if (!current?.sessionFile) {
@@ -181,11 +262,11 @@ async function commandRun(opts) {
     if (!task) {
       const state = baseState(opts, "done", { message: "All tasks are complete." });
       await writeCurrent(opts.workspace, state);
-      console.log("All tasks are complete.");
+      orchestratorLog(opts, "All tasks are complete.");
       return;
     }
 
-    console.log(`\n=== Running ${task.heading} ===`);
+    orchestratorLog(opts, `\n=== Running ${task.heading} ===`);
     const result = await runTask(opts, task);
     completedThisRun++;
 
@@ -194,16 +275,21 @@ async function commandRun(opts) {
 
     if (blocked) {
       await writeCurrent(opts.workspace, baseState(opts, "blocked", result.runRecord));
-      console.log("\nBlocked. Attach with:");
-      console.log(`  cd ${shellQuote(opts.workspace)} && pi --session ${shellQuote(result.runRecord.sessionFile)}`);
-      console.log(`\nMessage: ${result.final.message}`);
+      orchestratorLog(opts, "\nBlocked. Attach with:");
+      orchestratorLog(opts, `  cd ${shellQuote(opts.workspace)} && pi --session ${shellQuote(result.runRecord.sessionFile)}`);
+      orchestratorLog(opts, `\nMessage: ${result.final.message}`);
       process.exitCode = 2;
       return;
     }
 
-    console.log(`Completed: ${result.final.message}`);
+    orchestratorLog(opts, `Completed: ${result.final.message}`);
     if (opts.once) return;
   }
+}
+
+function orchestratorLog(opts, message = "") {
+  if (opts.observe === "raw") console.error(message);
+  else console.log(message);
 }
 
 function baseState(opts, status, extra = {}) {
@@ -212,6 +298,7 @@ function baseState(opts, status, extra = {}) {
     workspace: opts.workspace,
     plan: opts.plan,
     promptFile: opts.promptFile,
+    observe: opts.observe,
     updatedAt: new Date().toISOString(),
     ...extra,
   };
@@ -240,7 +327,7 @@ async function runTask(opts, task) {
   const runId = `${Date.now()}-task-${task.number}`;
   const logPath = path.join(paths.logs, `${runId}.jsonl`);
   const logStream = createWriteStream(logPath, { flags: "a" });
-  const rpc = new PiRpcProcess({ piCommand: opts.pi, cwd: opts.workspace, name: task.heading, logStream });
+  const rpc = new PiRpcProcess({ piCommand: opts.pi, cwd: opts.workspace, name: task.heading, logStream, observe: opts.observe });
 
   let sessionState = null;
   let finalText = "";
@@ -287,6 +374,7 @@ async function runTask(opts, task) {
     workspace: opts.workspace,
     plan: opts.plan,
     promptFile: opts.promptFile,
+    observe: opts.observe,
     task,
     sessionFile: sessionState?.sessionFile,
     sessionId: sessionState?.sessionId,
@@ -411,12 +499,104 @@ function jsonCandidates(text) {
   return [...new Set(candidates)];
 }
 
+class EventObserver {
+  constructor({ mode = "compact" } = {}) {
+    this.mode = mode;
+    this.needsNewline = false;
+    this.activeAssistantHadDelta = false;
+  }
+
+  observeLine(line) {
+    if (this.mode === "raw") console.log(line);
+  }
+
+  observeEvent(event) {
+    if (this.mode === "raw" || this.mode === "quiet") return;
+    if (this.mode === "transcript") this.observeTranscript(event);
+    else this.observeCompact(event);
+  }
+
+  observeCompact(event) {
+    if (event.type === "tool_execution_start") {
+      this.println(formatToolStart(event));
+    } else if (event.type === "tool_execution_end") {
+      this.println(`${event.isError ? "✗" : "✓"} ${event.toolName}`);
+      const text = extractResultText(event.result);
+      if (text) this.printIndented(truncateText(text, event.isError ? 3000 : 1200));
+    } else if (event.type === "message_start" && event.message?.role === "assistant") {
+      this.activeAssistantHadDelta = false;
+    } else if (event.type === "message_update" && event.assistantMessageEvent?.type === "text_delta") {
+      this.activeAssistantHadDelta = true;
+      this.write(event.assistantMessageEvent.delta);
+    } else if (event.type === "message_end" && event.message?.role === "assistant" && !this.activeAssistantHadDelta) {
+      const text = extractMessageText(event.message);
+      if (text) this.write(text);
+    } else if (event.type === "agent_end") {
+      this.println("[agent complete]");
+    } else if (event.type === "compaction_start") {
+      this.println(`[compaction started: ${event.reason ?? "manual"}]`);
+    } else if (event.type === "compaction_end") {
+      this.println(`[compaction ${event.aborted ? "aborted" : event.result ? "complete" : "failed"}]`);
+    } else if (event.type === "auto_retry_start") {
+      this.println(`[retry ${event.attempt}/${event.maxAttempts} in ${event.delayMs}ms] ${event.errorMessage ?? ""}`.trim());
+    } else if (event.type === "auto_retry_end") {
+      this.println(`[retry ${event.success ? "succeeded" : "failed"}]`);
+    } else if (event.type === "queue_update") {
+      this.println(`[queue] steering=${event.steering?.length ?? 0} followUp=${event.followUp?.length ?? 0}`);
+    }
+  }
+
+  observeTranscript(event) {
+    if (event.type === "message_end" && event.message?.role === "user") {
+      this.println("\nuser>");
+      this.printIndented(truncateText(extractMessageText(event.message), 2500));
+    } else if (event.type === "message_start" && event.message?.role === "assistant") {
+      this.activeAssistantHadDelta = false;
+      this.println("\nassistant>");
+    } else if (event.type === "message_update" && event.assistantMessageEvent?.type === "text_delta") {
+      this.activeAssistantHadDelta = true;
+      this.write(event.assistantMessageEvent.delta);
+    } else if (event.type === "message_end" && event.message?.role === "assistant" && !this.activeAssistantHadDelta) {
+      const text = extractMessageText(event.message);
+      if (text) this.write(text);
+    } else if (event.type === "tool_execution_start") {
+      this.println(`\ntool> ${formatToolStart(event)}`);
+    } else if (event.type === "tool_execution_end") {
+      this.println(`${event.isError ? "✗" : "✓"} ${event.toolName}`);
+      const text = extractResultText(event.result);
+      if (text) this.printIndented(truncateText(text, 5000));
+    } else if (event.type === "agent_end") {
+      this.println("\n[agent complete]");
+    } else if (event.type === "compaction_start" || event.type === "compaction_end" || event.type === "auto_retry_start" || event.type === "auto_retry_end" || event.type === "queue_update") {
+      this.observeCompact(event);
+    }
+  }
+
+  write(text) {
+    if (!text) return;
+    process.stdout.write(text);
+    this.needsNewline = !String(text).endsWith("\n");
+  }
+
+  println(text = "") {
+    if (this.needsNewline) process.stdout.write("\n");
+    console.log(text);
+    this.needsNewline = false;
+  }
+
+  printIndented(text) {
+    if (!text) return;
+    this.println(indent(text.trimEnd(), "  "));
+  }
+}
+
 class PiRpcProcess {
-  constructor({ piCommand, cwd, name, logStream }) {
+  constructor({ piCommand, cwd, name, logStream, observe = "compact" }) {
     this.piCommand = piCommand;
     this.cwd = cwd;
     this.name = name;
     this.logStream = logStream;
+    this.observer = new EventObserver({ mode: observe });
     this.proc = null;
     this.nextId = 1;
     this.pending = new Map();
@@ -470,12 +650,13 @@ class PiRpcProcess {
   handleLine(line) {
     if (!line.trim()) return;
     this.logStream?.write(line + "\n");
+    this.observer.observeLine(line);
 
     let message;
     try {
       message = JSON.parse(line);
     } catch (error) {
-      console.error(`Failed to parse pi RPC line: ${line}`);
+      if (this.observer.mode !== "raw" && this.observer.mode !== "quiet") console.error(`Failed to parse pi RPC line: ${line}`);
       return;
     }
 
@@ -489,23 +670,10 @@ class PiRpcProcess {
       return;
     }
 
-    this.printEvent(message);
+    this.observer.observeEvent(message);
     const matching = this.eventWaiters.filter((waiter) => waiter.type === message.type);
     this.eventWaiters = this.eventWaiters.filter((waiter) => waiter.type !== message.type);
     for (const waiter of matching) waiter.resolve(message);
-  }
-
-  printEvent(event) {
-    if (event.type === "tool_execution_start") {
-      if (event.toolName === "bash" && event.args?.command) console.log(`$ ${truncateLine(event.args.command)}`);
-      else console.log(`tool: ${event.toolName}`);
-    } else if (event.type === "tool_execution_end") {
-      console.log(`${event.isError ? "✗" : "✓"} ${event.toolName}`);
-    } else if (event.type === "message_update" && event.assistantMessageEvent?.type === "text_delta") {
-      process.stdout.write(event.assistantMessageEvent.delta);
-    } else if (event.type === "agent_end") {
-      console.log("\n[agent complete]");
-    }
   }
 
   async stop() {
@@ -544,6 +712,54 @@ function attachJsonlReader(stream, onLine) {
   });
 }
 
+function formatToolStart(event) {
+  const args = event.args ?? {};
+  if (event.toolName === "bash" && args.command) return `$ ${truncateLine(args.command)}`;
+  if (event.toolName === "read" && args.path) return `read ${args.path}${args.offset ? `:${args.offset}` : ""}`;
+  if (event.toolName === "edit" && args.path) return `edit ${args.path}${Array.isArray(args.edits) ? ` (${args.edits.length} edit${args.edits.length === 1 ? "" : "s"})` : ""}`;
+  if (event.toolName === "write" && args.path) return `write ${args.path}`;
+  if (event.toolName === "grep") return `grep ${args.pattern ? JSON.stringify(args.pattern) : ""}${args.path ? ` in ${args.path}` : ""}`.trim();
+  if (event.toolName === "find") return `find ${args.path ?? "."}${args.pattern ? ` ${JSON.stringify(args.pattern)}` : ""}`;
+  if (event.toolName === "ls") return `ls ${args.path ?? "."}`;
+  return `tool: ${event.toolName}${Object.keys(args).length ? ` ${truncateLine(JSON.stringify(args), 160)}` : ""}`;
+}
+
+function extractResultText(result) {
+  return extractContentText(result?.content);
+}
+
+function extractMessageText(message) {
+  return extractContentText(message?.content);
+}
+
+function extractContentText(content) {
+  if (!content) return "";
+  if (typeof content === "string") return content;
+  if (!Array.isArray(content)) return "";
+  return content
+    .map((part) => {
+      if (!part) return "";
+      if (typeof part === "string") return part;
+      if (part.type === "text") return part.text ?? "";
+      if (part.type === "thinking") return part.thinking ? `[thinking]\n${part.thinking}` : "";
+      if (part.type === "toolCall") return `[tool call: ${part.name ?? "unknown"}]`;
+      if (part.type === "image") return "[image]";
+      return "";
+    })
+    .filter(Boolean)
+    .join("\n");
+}
+
+function truncateText(text, max = 1200) {
+  const value = String(text ?? "");
+  if (value.length <= max) return value;
+  return `${value.slice(0, max)}\n… [truncated ${value.length - max} chars]`;
+}
+
+function indent(text, prefix = "  ") {
+  return String(text).split("\n").map((line) => `${prefix}${line}`).join("\n");
+}
+
 function delay(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
@@ -563,6 +779,7 @@ async function main() {
     if (opts.command === "help") usage(0);
     if (opts.command === "tasks") await commandTasks(opts);
     else if (opts.command === "run") await commandRun(opts);
+    else if (opts.command === "tail") await commandTail(opts);
     else if (opts.command === "status") await commandStatus(opts);
     else if (opts.command === "attach") await commandAttach(opts);
     else usage(1);

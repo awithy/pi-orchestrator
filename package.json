@@ -11,6 +11,7 @@
     "start": "node ./src/cli.js",
     "tasks": "node ./src/cli.js tasks",
     "run": "node ./src/cli.js run",
+    "tail": "node ./src/cli.js tail",
     "status": "node ./src/cli.js status",
     "attach": "node ./src/cli.js attach"
   },
