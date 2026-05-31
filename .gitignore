@@ -1,0 +1,4 @@
+node_modules/
+.pi-orchestrator/
+*.log
+.DS_Store

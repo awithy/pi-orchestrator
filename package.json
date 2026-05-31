@@ -1,0 +1,20 @@
+{
+  "name": "pi-orchestrator",
+  "version": "0.1.0",
+  "license": "MIT",
+  "private": true,
+  "type": "module",
+  "bin": {
+    "pi-orchestrator": "./src/cli.js"
+  },
+  "scripts": {
+    "start": "node ./src/cli.js",
+    "tasks": "node ./src/cli.js tasks",
+    "run": "node ./src/cli.js run",
+    "status": "node ./src/cli.js status",
+    "attach": "node ./src/cli.js attach"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}
